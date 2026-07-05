@@ -1,5 +1,6 @@
 node_modules/
 dist/
 .env
+.env.example
 data/user-profiles.json
 .DS_Store

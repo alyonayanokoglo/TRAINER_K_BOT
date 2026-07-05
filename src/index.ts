@@ -83,6 +83,7 @@ const drafts = new Map<number, Draft>();
 const schedules = new Map<string, Schedule>();
 const userProfiles = loadUserProfiles();
 const pendingNameRequests = new Map<number, PendingNameRequest>();
+let activeScheduleId: string | undefined;
 
 if (trainerIds.size === 0) {
   console.warn(
@@ -383,6 +384,14 @@ async function handleBookingCallback(ctx: CallbackContext, data: string) {
     return;
   }
 
+  if (!isActiveSchedule(schedule)) {
+    await closePublishedSchedule(ctx, schedule);
+    await ctx.answerCbQuery("Запись по этому расписанию уже закрыта.", {
+      show_alert: true,
+    });
+    return;
+  }
+
   if (action === "date") {
     const [dateKey] = params;
     if (!dateKey || !hasBookableSlots(schedule, dateKey)) {
@@ -465,6 +474,14 @@ async function handleCancelCallback(ctx: CallbackContext, data: string) {
 
   if (!ctx.from || !schedule) {
     await ctx.answerCbQuery("Это расписание уже недоступно.", {
+      show_alert: true,
+    });
+    return;
+  }
+
+  if (!isActiveSchedule(schedule)) {
+    await closePublishedSchedule(ctx, schedule);
+    await ctx.answerCbQuery("Это расписание уже закрыто.", {
       show_alert: true,
     });
     return;
@@ -560,6 +577,7 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
   }
 
   try {
+    const previousSchedule = getActiveSchedule();
     const message = await ctx.telegram.sendMessage(
       schedule.groupChatId,
       scheduleText(schedule),
@@ -567,7 +585,9 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
     );
     schedule.messageId = message.message_id;
     schedules.set(schedule.id, schedule);
+    activeScheduleId = schedule.id;
     drafts.delete(trainerId);
+    await closePublishedSchedule(ctx, previousSchedule);
 
     await ctx.answerCbQuery("Расписание опубликовано.");
     await replaceCallbackMessage(
@@ -750,6 +770,14 @@ function scheduleText(schedule: Schedule) {
   return lines.join("\n");
 }
 
+function closedScheduleText(schedule: Schedule) {
+  return [
+    scheduleText(schedule),
+    "",
+    "Запись по этому расписанию закрыта. Актуальное расписание опубликовано отдельным сообщением.",
+  ].join("\n");
+}
+
 function scheduleKeyboard(schedule: Schedule) {
   const dateButtons = schedule.includedDates
     .filter((dateKey) => hasBookableSlots(schedule, dateKey))
@@ -855,12 +883,38 @@ async function updateScheduleKeyboard(
   }
 }
 
+async function closePublishedSchedule(
+  ctx: BotContext,
+  schedule: Schedule | undefined,
+) {
+  if (!schedule?.messageId) return;
+
+  try {
+    await ctx.telegram.editMessageText(
+      schedule.groupChatId,
+      schedule.messageId,
+      undefined,
+      closedScheduleText(schedule),
+    );
+  } catch (error) {
+    console.error("Failed to close schedule message", error);
+  }
+}
+
 function participantsLabel(slot: Slot) {
   return [...slot.bookings.values()].map((user) => user.name).join(", ");
 }
 
 function hasBookableSlots(schedule: Schedule, dateKey: string) {
   return schedule.slots.some((slot) => slot.dateKey === dateKey);
+}
+
+function getActiveSchedule() {
+  return activeScheduleId ? schedules.get(activeScheduleId) : undefined;
+}
+
+function isActiveSchedule(schedule: Schedule) {
+  return schedule.id === activeScheduleId;
 }
 
 function getUserBookings(schedule: Schedule, userId: number) {
@@ -921,6 +975,14 @@ async function completePendingBooking(
   if (!schedule || !slot) {
     await ctx.reply(
       `Имя сохранено: ${name}\nНо выбранное расписание уже недоступно.`,
+    );
+    return;
+  }
+
+  if (!isActiveSchedule(schedule)) {
+    await closePublishedSchedule(ctx, schedule);
+    await ctx.reply(
+      `Имя сохранено: ${name}\nНо запись по этому расписанию уже закрыта.`,
     );
     return;
   }
