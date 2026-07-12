@@ -57,7 +57,7 @@ type UserProfile = {
 };
 
 type PendingNameRequest = {
-  mode: "booking" | "profile";
+  mode: "booking" | "profile" | "manual-add";
   requestedAt: number;
   scheduleId?: string;
   slotId?: string;
@@ -84,6 +84,7 @@ const schedules = new Map<string, Schedule>();
 const userProfiles = loadUserProfiles();
 const pendingNameRequests = new Map<number, PendingNameRequest>();
 let activeScheduleId: string | undefined;
+let manualBookingCounter = -1;
 
 if (trainerIds.size === 0) {
   console.warn(
@@ -124,6 +125,7 @@ bot.start(async (ctx) => {
     ].join("\n"),
     Markup.inlineKeyboard([
       [Markup.button.callback("☀️ Создать расписание", "trainer:new")],
+      [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
     ]),
   );
 });
@@ -140,6 +142,11 @@ bot.command("whoami", async (ctx) => {
 
 bot.command("chatid", async (ctx) => {
   await ctx.reply(`ID этого чата: ${ctx.chat.id}`);
+});
+
+bot.command("add", async (ctx) => {
+  if (!ctx.from || !ensurePrivateTrainer(ctx)) return;
+  await showManualAddDates(ctx);
 });
 
 bot.command("name", async (ctx) => {
@@ -185,8 +192,14 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  saveUserProfile(ctx.from.id, name);
   pendingNameRequests.delete(ctx.from.id);
+
+  if (pending.mode === "manual-add") {
+    await completeManualAdd(ctx, pending, name);
+    return;
+  }
+
+  saveUserProfile(ctx.from.id, name);
 
   if (pending.mode === "booking") {
     await completePendingBooking(ctx, pending, name);
@@ -256,6 +269,25 @@ async function handleTrainerCallback(ctx: CallbackContext, data: string) {
 
     await ctx.answerCbQuery();
     await replaceCallbackMessage(ctx, renderDatesText(draft), datesKeyboard(draft));
+    return;
+  }
+
+  if (action === "manual-add") {
+    await ctx.answerCbQuery();
+    await showManualAddDates(ctx, true);
+    return;
+  }
+
+  if (action === "manual-date") {
+    const [dateKey] = params;
+    await ctx.answerCbQuery();
+    await showManualAddTimes(ctx, dateKey);
+    return;
+  }
+
+  if (action === "manual-slot") {
+    const [scheduleId, slotId] = params;
+    await startManualAdd(ctx, scheduleId, slotId);
     return;
   }
 
@@ -552,6 +584,93 @@ async function showWeekPicker(ctx: BotContext, edit = false) {
   await ctx.reply(renderWeeksText(), weeksKeyboard());
 }
 
+async function showManualAddDates(ctx: BotContext, edit = false) {
+  const schedule = getActiveSchedule();
+  if (!schedule) {
+    const text = "Сначала опубликуйте расписание, потом можно добавлять участников вручную.";
+    if (edit && "editMessageText" in ctx) {
+      await replaceCallbackMessage(
+        ctx as CallbackContext,
+        text,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("☀️ Создать расписание", "trainer:new")],
+        ]),
+      );
+      return;
+    }
+
+    await ctx.reply(text);
+    return;
+  }
+
+  if (edit && "editMessageText" in ctx) {
+    await replaceCallbackMessage(
+      ctx as CallbackContext,
+      renderManualAddDatesText(schedule),
+      manualAddDatesKeyboard(schedule),
+    );
+    return;
+  }
+
+  await ctx.reply(renderManualAddDatesText(schedule), manualAddDatesKeyboard(schedule));
+}
+
+async function showManualAddTimes(ctx: CallbackContext, dateKey?: string) {
+  const schedule = getActiveSchedule();
+  if (!schedule || !dateKey || !hasBookableSlots(schedule, dateKey)) {
+    await replaceCallbackMessage(
+      ctx,
+      "Не нашла активные слоты на эту дату.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("← К датам", "trainer:manual-add")],
+      ]),
+    );
+    return;
+  }
+
+  await replaceCallbackMessage(
+    ctx,
+    renderManualAddTimesText(schedule, dateKey),
+    manualAddTimesKeyboard(schedule, dateKey),
+  );
+}
+
+async function startManualAdd(
+  ctx: CallbackContext,
+  scheduleId?: string,
+  slotId?: string,
+) {
+  const schedule = scheduleId ? schedules.get(scheduleId) : undefined;
+  const slot = schedule?.slots.find((candidate) => candidate.id === slotId);
+
+  if (!ctx.from || !schedule || !slot || !isActiveSchedule(schedule)) {
+    await ctx.answerCbQuery("Этот слот уже недоступен.", { show_alert: true });
+    return;
+  }
+
+  if (slot.bookings.size >= MAX_BOOKINGS_PER_SLOT) {
+    await ctx.answerCbQuery("На это время мест уже нет.", { show_alert: true });
+    return;
+  }
+
+  pendingNameRequests.set(ctx.from.id, {
+    mode: "manual-add",
+    requestedAt: Date.now(),
+    scheduleId: schedule.id,
+    slotId: slot.id,
+  });
+
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    [
+      `Введите имя участника для ${formatDateShort(slot.dateKey)}, ${slot.time}.`,
+      "",
+      "Например: Алена Я, Кристина 2, Полина.",
+    ].join("\n"),
+    namePromptMarkup(),
+  );
+}
+
 async function publishDraft(ctx: CallbackContext, draft: Draft) {
   const trainerId = ctx.from?.id;
   if (!trainerId) {
@@ -599,6 +718,7 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
       ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.callback("☀️ Создать новое", "trainer:new")],
+        [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
       ]),
     );
   } catch (error) {
@@ -664,6 +784,57 @@ function weeksKeyboard() {
   });
 
   return Markup.inlineKeyboard(rows);
+}
+
+function renderManualAddDatesText(schedule: Schedule) {
+  return [
+    "➕ Ручное добавление участника",
+    "",
+    `Активное расписание: ${scheduleRangeLabel(schedule)}`,
+    "Выберите дату, куда нужно добавить участника.",
+  ].join("\n");
+}
+
+function manualAddDatesKeyboard(schedule: Schedule) {
+  const dateButtons = schedule.includedDates
+    .filter((dateKey) => hasBookableSlots(schedule, dateKey))
+    .map((dateKey) =>
+      Markup.button.callback(
+        formatDateWithDay(dateKey),
+        `trainer:manual-date:${dateKey}`,
+      ),
+    );
+
+  return Markup.inlineKeyboard([
+    ...chunk(dateButtons, 2),
+    [Markup.button.callback("☀️ Создать новое расписание", "trainer:new")],
+  ]);
+}
+
+function renderManualAddTimesText(schedule: Schedule, dateKey: string) {
+  return [
+    "➕ Ручное добавление участника",
+    "",
+    `${formatDateWithDay(dateKey)}`,
+    "Выберите время.",
+  ].join("\n");
+}
+
+function manualAddTimesKeyboard(schedule: Schedule, dateKey: string) {
+  const slotButtons = schedule.slots
+    .filter((slot) => slot.dateKey === dateKey)
+    .sort((first, second) => compareTimes(first.time, second.time))
+    .map((slot) =>
+      Markup.button.callback(
+        `${slot.time} (${slot.bookings.size}/${MAX_BOOKINGS_PER_SLOT})`,
+        `trainer:manual-slot:${schedule.id}:${slot.id}`,
+      ),
+    );
+
+  return Markup.inlineKeyboard([
+    ...chunk(slotButtons, 2),
+    [Markup.button.callback("← К датам", "trainer:manual-add")],
+  ]);
 }
 
 function renderDatesText(draft: Draft) {
@@ -1012,6 +1183,51 @@ async function completePendingBooking(
       slot.time
     }.`,
   );
+}
+
+async function completeManualAdd(
+  ctx: BotContext,
+  pending: PendingNameRequest,
+  name: string,
+) {
+  if (!pending.scheduleId || !pending.slotId) {
+    await ctx.reply("Не нашла слот для ручной записи. Попробуйте добавить заново.");
+    return;
+  }
+
+  const schedule = schedules.get(pending.scheduleId);
+  const slot = schedule?.slots.find((candidate) => candidate.id === pending.slotId);
+
+  if (!schedule || !slot || !isActiveSchedule(schedule)) {
+    await ctx.reply("Этот слот уже недоступен. Выберите актуальное расписание.");
+    return;
+  }
+
+  if (slot.bookings.size >= MAX_BOOKINGS_PER_SLOT) {
+    await ctx.reply(
+      `На ${formatDateShort(slot.dateKey)}, ${slot.time} мест уже нет.`,
+    );
+    return;
+  }
+
+  const manualUserId = nextManualBookingId();
+  slot.bookings.set(manualUserId, {
+    id: manualUserId,
+    name,
+  });
+  await updatePublishedSchedule(ctx, schedule);
+
+  await ctx.reply(
+    `Добавила: ${name} на ${formatDateShort(slot.dateKey)}, ${slot.time}.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Добавить еще", "trainer:manual-add")],
+    ]),
+  );
+}
+
+function nextManualBookingId() {
+  manualBookingCounter -= 1;
+  return manualBookingCounter;
 }
 
 function userFromProfile(ctx: BotContext, name: string): BookingUser {
