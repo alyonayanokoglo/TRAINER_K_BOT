@@ -23,6 +23,8 @@ const DEFAULT_SLOT_TIMES = [
 ];
 
 type Draft = {
+  commentsByDate: Map<string, string>;
+  scheduleId?: string;
   weekStart: Date;
   includedDates: Set<string>;
   timesByDate: Map<string, Set<string>>;
@@ -43,6 +45,7 @@ type Slot = {
 };
 
 type Schedule = {
+  commentsByDate: Map<string, string>;
   id: string;
   createdBy: number;
   groupChatId: number;
@@ -82,6 +85,7 @@ const bot = new Telegraf(botToken);
 const drafts = new Map<number, Draft>();
 const schedules = new Map<string, Schedule>();
 const userProfiles = loadUserProfiles();
+const pendingComments = new Map<number, { draft: Draft; dateKey: string }>();
 const pendingNameRequests = new Map<number, PendingNameRequest>();
 let activeScheduleId: string | undefined;
 let manualBookingCounter = -1;
@@ -125,6 +129,7 @@ bot.start(async (ctx) => {
     ].join("\n"),
     Markup.inlineKeyboard([
       [Markup.button.callback("☀️ Создать расписание", "trainer:new")],
+      [Markup.button.callback("✏️ Редактировать расписание", "trainer:edit")],
       [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
     ]),
   );
@@ -176,6 +181,29 @@ bot.command("name", async (ctx) => {
 
 bot.on("text", async (ctx) => {
   if (!ctx.from || ctx.chat.type !== "private") return;
+
+  const commentRequest = pendingComments.get(ctx.from.id);
+  if (commentRequest) {
+    if (!isTrainer(ctx.from.id) || drafts.get(ctx.from.id) !== commentRequest.draft) {
+      pendingComments.delete(ctx.from.id);
+      await ctx.reply("Черновик изменился. Выберите дату заново.");
+      return;
+    }
+    const text = ctx.message.text.trim();
+    if (text.startsWith("/")) {
+      await ctx.reply("Напишите комментарий обычным текстом или вернитесь к выбору даты.");
+      return;
+    }
+    if (!text || text.length > 1500) {
+      await ctx.reply("Комментарий должен содержать от 1 до 1500 символов. Сократите текст и попробуйте снова.");
+      return;
+    }
+    commentRequest.draft.commentsByDate.set(commentRequest.dateKey, text);
+    pendingComments.delete(ctx.from.id);
+    await ctx.reply(renderTimesText(commentRequest.draft, commentRequest.dateKey),
+      timesKeyboard(commentRequest.draft, commentRequest.dateKey));
+    return;
+  }
 
   const pending = pendingNameRequests.get(ctx.from.id);
   if (!pending) return;
@@ -250,10 +278,32 @@ async function handleTrainerCallback(ctx: CallbackContext, data: string) {
   }
 
   const [, action, ...params] = data.split(":");
+  pendingComments.delete(ctx.from.id);
 
   if (action === "new") {
     await ctx.answerCbQuery();
     await showWeekPicker(ctx, true);
+    return;
+  }
+
+  if (action === "edit") {
+    const schedule = getActiveSchedule();
+    if (!schedule) {
+      await ctx.answerCbQuery("Сначала опубликуйте расписание.", { show_alert: true });
+      return;
+    }
+    const draft = createDraft(dateFromKey(schedule.includedDates[0]));
+    draft.scheduleId = schedule.id;
+    draft.commentsByDate = new Map(schedule.commentsByDate);
+    for (const date of schedule.includedDates) {
+      draft.includedDates.add(date);
+      const slots = schedule.slots.filter((slot) => slot.dateKey === date);
+      if (slots.length) draft.timesByDate.set(date, new Set(slots.map((slot) => slot.time)));
+      else draft.restDates.add(date);
+    }
+    drafts.set(ctx.from.id, draft);
+    await ctx.answerCbQuery();
+    await replaceCallbackMessage(ctx, renderDatesText(draft), datesKeyboard(draft));
     return;
   }
 
@@ -296,6 +346,26 @@ async function handleTrainerCallback(ctx: CallbackContext, data: string) {
     await ctx.answerCbQuery("Черновик не найден. Создайте расписание заново.", {
       show_alert: true,
     });
+    return;
+  }
+
+  if (action === "comment" || action === "remove-comment") {
+    const [dateKey] = params;
+    if (!dateKey || !isDraftDate(draft, dateKey)) {
+      await ctx.answerCbQuery("Дата не найдена.", { show_alert: true });
+      return;
+    }
+    await ctx.answerCbQuery();
+    if (action === "remove-comment") {
+      draft.commentsByDate.delete(dateKey);
+      await replaceCallbackMessage(ctx, renderTimesText(draft, dateKey), timesKeyboard(draft, dateKey));
+    } else {
+      pendingNameRequests.delete(ctx.from.id);
+      pendingComments.set(ctx.from.id, { draft, dateKey });
+      await replaceCallbackMessage(ctx,
+        `Напишите комментарий к ${formatDateWithDay(dateKey)} (до 1500 символов). Переносы строк и эмодзи сохранятся.\n\nКомментарий появится под датой после сохранения расписания. Для публикации дня выберите время или выходной.`,
+        Markup.inlineKeyboard([[Markup.button.callback("← Отмена", `trainer:open-date:${dateKey}`)]]));
+    }
     return;
   }
 
@@ -391,13 +461,18 @@ async function handleTrainerCallback(ctx: CallbackContext, data: string) {
     draft.includedDates.delete(dateKey);
     draft.timesByDate.delete(dateKey);
     draft.restDates.delete(dateKey);
+    draft.commentsByDate.delete(dateKey);
 
     await ctx.answerCbQuery("Дата убрана из расписания.");
     await replaceCallbackMessage(ctx, renderDatesText(draft), datesKeyboard(draft));
     return;
   }
 
-  if (action === "publish") {
+  if (action === "publish" || action === "confirm-edit") {
+    if (draft.scheduleId) {
+      await saveScheduleEdit(ctx, draft, action === "confirm-edit");
+      return;
+    }
     await publishDraft(ctx, draft);
     return;
   }
@@ -695,6 +770,11 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
     return;
   }
 
+  if (scheduleText(schedule).length > 4000) {
+    await ctx.answerCbQuery("Расписание слишком длинное. Сократите комментарии или количество слотов.", { show_alert: true });
+    return;
+  }
+
   try {
     const previousSchedule = getActiveSchedule();
     const message = await ctx.telegram.sendMessage(
@@ -718,7 +798,8 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
       ].join("\n"),
       Markup.inlineKeyboard([
         [Markup.button.callback("☀️ Создать новое", "trainer:new")],
-        [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
+        [Markup.button.callback("✏️ Редактировать расписание", "trainer:edit")],
+      [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
       ]),
     );
   } catch (error) {
@@ -730,8 +811,64 @@ async function publishDraft(ctx: CallbackContext, draft: Draft) {
   }
 }
 
+async function saveScheduleEdit(ctx: CallbackContext, draft: Draft, confirmed: boolean) {
+  const schedule = draft.scheduleId ? schedules.get(draft.scheduleId) : undefined;
+  if (!schedule || !isActiveSchedule(schedule) || !schedule.messageId) {
+    await ctx.answerCbQuery("Это расписание уже недоступно. Откройте редактирование заново.", { show_alert: true });
+    return;
+  }
+  const updated = createSchedule(draft, schedule.createdBy, schedule.groupChatId);
+  if (!updated.includedDates.length) {
+    await ctx.answerCbQuery("Выберите хотя бы один день.", { show_alert: true });
+    return;
+  }
+  const removed = schedule.slots.filter((slot) =>
+    slot.bookings.size > 0 && !updated.slots.some((next) => next.id === slot.id));
+  if (removed.length && !confirmed) {
+    await ctx.answerCbQuery();
+    await replaceCallbackMessage(ctx,
+      ["Будут удалены тренировки с участниками:",
+        ...removed.map((slot) => `${formatDateWithDay(slot.dateKey)} ${slot.time}: ${slot.bookings.size} чел.`),
+        "", "Их записи будут отменены. Сохранить изменения?"].join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Удалить записи и сохранить", "trainer:confirm-edit")],
+        [Markup.button.callback("← Вернуться к редактированию", "trainer:dates")],
+      ]));
+    return;
+  }
+  updated.slots = updated.slots.map((slot) => schedule.slots.find((old) => old.id === slot.id) ?? slot);
+  const next: Schedule = { ...schedule, includedDates: updated.includedDates, slots: updated.slots, commentsByDate: updated.commentsByDate };
+  if (scheduleText(next).length > 4000) {
+    await ctx.answerCbQuery("Расписание слишком длинное. Сократите комментарии или количество слотов.", { show_alert: true });
+    return;
+  }
+  try {
+    await ctx.telegram.editMessageText(schedule.groupChatId, schedule.messageId, undefined,
+      scheduleText(next), scheduleKeyboard(next));
+  } catch (error) {
+    const description = (error as { response?: { description?: string } }).response?.description;
+    if (!description?.includes("message is not modified")) {
+      console.error("Failed to save schedule edit", error);
+      await ctx.answerCbQuery("Не удалось обновить сообщение. Изменения не сохранены, попробуйте ещё раз.", { show_alert: true });
+      return;
+    }
+  }
+  schedule.commentsByDate = next.commentsByDate;
+  schedule.includedDates = next.includedDates;
+  schedule.slots = next.slots;
+  if (ctx.from) drafts.delete(ctx.from.id);
+  await ctx.answerCbQuery("Изменения сохранены.");
+  await replaceCallbackMessage(ctx, "Расписание в группе обновлено. Записи на оставшиеся тренировки сохранены.",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("✏️ Редактировать расписание", "trainer:edit")],
+      [Markup.button.callback("➕ Добавить участника", "trainer:manual-add")],
+      [Markup.button.callback("☀️ Создать новое", "trainer:new")],
+    ]));
+}
+
 function createDraft(weekStart = startOfWeek(new Date())): Draft {
   return {
+    commentsByDate: new Map(),
     weekStart: startOfWeek(weekStart),
     includedDates: new Set(),
     timesByDate: new Map(),
@@ -760,6 +897,7 @@ function createSchedule(
     createdBy: trainerId,
     groupChatId: targetGroupChatId,
     includedDates,
+    commentsByDate: new Map([...draft.commentsByDate].filter(([date]) => draft.includedDates.has(date))),
     slots,
   };
 }
@@ -839,7 +977,7 @@ function manualAddTimesKeyboard(schedule: Schedule, dateKey: string) {
 
 function renderDatesText(draft: Draft) {
   return [
-    `☀️ Новое расписание ${weekRangeLabel(draft.weekStart)}`,
+    `${draft.scheduleId ? "✏️ Редактирование расписания" : "☀️ Новое расписание"} ${weekRangeLabel(draft.weekStart)}`,
     "",
     "Выберите дату, затем отметьте свободное время или выходной.",
     "Дни со слотами отмечены галочкой, выходные — 🌸.",
@@ -851,6 +989,7 @@ function renderTimesText(draft: Draft, dateKey: string) {
   const isRestDay = draft.restDates.has(dateKey);
   return [
     `🌸 ${formatDateWithDay(dateKey)}`,
+    draft.commentsByDate.get(dateKey) ? `Комментарий:\n${draft.commentsByDate.get(dateKey)}` : "Комментарий пока не добавлен.",
     "",
     "Кликните на свободное время или отметьте день как выходной.",
     "",
@@ -877,7 +1016,7 @@ function datesKeyboard(draft: Draft) {
 
   rows.push([
     Markup.button.callback(
-      "📣 Опубликовать расписание",
+      draft.scheduleId ? "💾 Сохранить изменения" : "📣 Опубликовать расписание",
       "trainer:publish",
     ),
   ]);
@@ -905,6 +1044,8 @@ function timesKeyboard(draft: Draft, dateKey: string) {
       ),
     ],
     ...timeRows,
+    [Markup.button.callback(draft.commentsByDate.has(dateKey) ? "✏️ Изменить комментарий" : "💬 Добавить комментарий", `trainer:comment:${dateKey}`)],
+    ...(draft.commentsByDate.has(dateKey) ? [[Markup.button.callback("🗑 Удалить комментарий", `trainer:remove-comment:${dateKey}`)]] : []),
     [
       Markup.button.callback(
         "🗑 Убрать дату",
@@ -912,7 +1053,7 @@ function timesKeyboard(draft: Draft, dateKey: string) {
       ),
     ],
     [Markup.button.callback("← К датам", "trainer:dates")],
-    [Markup.button.callback("📣 Опубликовать расписание", "trainer:publish")],
+    [Markup.button.callback(draft.scheduleId ? "💾 Сохранить изменения" : "📣 Опубликовать расписание", "trainer:publish")],
   ]);
 }
 
@@ -925,11 +1066,15 @@ function scheduleText(schedule: Schedule) {
       .sort((first, second) => compareTimes(first.time, second.time));
 
     if (slots.length === 0) {
-      lines.push(`🌸 ${formatDateWithDay(dateKey)}: ВЫХОДНОЙ 🌸`, "");
+      lines.push(`🌸 ${formatDateWithDay(dateKey)}: ВЫХОДНОЙ 🌸`);
+      if (schedule.commentsByDate.has(dateKey)) lines.push(schedule.commentsByDate.get(dateKey)!);
+      lines.push("");
       continue;
     }
 
-    lines.push(dayHeader(dateKey), "");
+    lines.push(dayHeader(dateKey));
+    if (schedule.commentsByDate.has(dateKey)) lines.push(schedule.commentsByDate.get(dateKey)!);
+    lines.push("");
     for (const slot of slots) {
       const participants = participantsLabel(slot);
       lines.push(`⌚️ ${slot.time}${participants ? `: ${participants}` : ""}`);
